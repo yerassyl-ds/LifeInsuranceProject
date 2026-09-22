@@ -1,0 +1,6 @@
+parameter,value,description
+discount_rate,0.03,Annual interest rate used to discount future cash flows (time value of money)
+expense_loading,0.2,Fraction added to net premium to cover insurer expenses/profit margin
+min_age,18,Minimum issue age supported by the mortality table
+max_age,100,Maximum age supported by the mortality table (assumed certain death after this)
+default_term_years,20,"Default term length (years) for a term life policy, if not specified"
