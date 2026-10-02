@@ -30,12 +30,31 @@ class Calculations:
         self.mortality_table = Datas().load_mortaility_table()
         self.risk_factors = Datas().load_risk_factors()
 
+        # ---- Precompute everything that doesn't change per call ----
+        # Doing pandas .at[] lookups and re-multiplying the risk factors on
+        # every single method call is what made this slow at scale (1000s
+        # of policies x 25 years x 1000s of simulations). Instead, we look
+        # everything up ONCE here in __init__ and cache it as plain numpy
+        # arrays / floats, which are much faster to reuse.
+        self._risk_multiplier = self._compute_risk_multiplier()
 
-    def get_base_qx(self, age):
+        # adjusted_qx_array[i] = adjusted qx for age (self.age + i),
+        # for i = 0 .. (max_age - self.age). Precomputed once.
         column = f"qx_{self.sex}"
-        return self.mortality_table.at[age, column]
+        base_qx_series = self.mortality_table.loc[self.age:, column]
+        adj = (base_qx_series.to_numpy() * self._risk_multiplier)
+        self._adjusted_qx_array = np.minimum(adj, 1.0)
 
-    def get_risk_multiplier(self):
+        # survival_prob_array[i] = 1 - adjusted_qx_array[i]
+        self._survival_prob_array = 1 - self._adjusted_qx_array
+
+        # cumulative_survival[t] = probability of surviving t full years
+        # from self.age. cumulative_survival[0] = 1.0 by definition.
+        self._cumulative_survival = np.concatenate(
+            ([1.0], np.cumprod(self._survival_prob_array))
+        )
+
+    def _compute_risk_multiplier(self):
         rf = self.risk_factors
         multiplier = 1.0
         multiplier *= rf.at[("smoking", self.smoking), "multiplier"]
@@ -44,25 +63,29 @@ class Calculations:
         multiplier *= rf.at[("health_class", self.health_class), "multiplier"]
         return multiplier
 
+    # ---------- 1. base and adjusted qx ----------
+
+    def get_risk_multiplier(self):
+        return self._risk_multiplier
+
     def adjusted_qx(self, age):
-        adj = self.get_base_qx(age) * self.get_risk_multiplier()
-        return min(adj, 1.0)   
+        """adjusted_qx for a given absolute age (must be >= self.age)."""
+        index = age - self.age
+        return self._adjusted_qx_array[index]
 
-
+    # ---------- 2-4. survival / death probabilities ----------
 
     def survival_prob_one_year(self, age):
         return 1 - self.adjusted_qx(age)
 
     def cumulative_survival_prob(self, years):
-        prob = 1.0
-        for t in range(years):
-            prob *= self.survival_prob_one_year(self.age + t)
-        return prob
+        """Probability of surviving `years` full years from self.age."""
+        return self._cumulative_survival[years]
 
     def cumulative_death_prob(self, years):
         return 1 - self.cumulative_survival_prob(years)
 
-
+    # ---------- 5. death in a specific year k ----------
 
     def prob_death_in_year(self, k):
         survive_prior_years = self.cumulative_survival_prob(k - 1)
@@ -74,6 +97,7 @@ class Calculations:
     def discount_factor(self, k):
         return 1 / ((1 + self.discount_rate) ** k)
 
+    # ---------- 7-10. EPVs and premiums ----------
 
     def epv_benefit(self):
         total = 0
@@ -93,7 +117,7 @@ class Calculations:
     def gross_premium(self):
         return self.net_premium() * (1 + self.expense_loading)
 
-
+    # ---------- 11. variance / std dev of payout ----------
 
     def payout_variance(self):
         n_q_x = self.cumulative_death_prob(self.term_years)
@@ -102,20 +126,38 @@ class Calculations:
     def payout_std_dev(self):
         return self.payout_variance() ** 0.5
 
-
+    # ---------- 14. Monte Carlo simulation ----------
 
     def simulate_policy(self, n_simulations=10000, seed=None):
+        """
+        Vectorized Monte Carlo simulation. For each of n_simulations
+        "parallel worlds", draws one random number per policy-year and
+        compares it against that year's adjusted_qx, all at once with
+        numpy instead of a Python-level double loop. Much faster than
+        a naive year-by-year, simulation-by-simulation loop.
+        """
         rng = np.random.default_rng(seed)
-        pv_payouts = np.zeros(n_simulations)
 
-        for i in range(n_simulations):
-            for k in range(1, self.term_years + 1):
-                if rng.random() < self.adjusted_qx(self.age + k - 1):
-                    pv_payouts[i] = self.face_amount * self.discount_factor(k)
-                    break  
+        qx_term = self._adjusted_qx_array[:self.term_years]  # shape (term_years,)
+        # random numbers: shape (n_simulations, term_years)
+        draws = rng.random((n_simulations, self.term_years))
+
+        # True where death "occurs" in that policy-year, for each simulation
+        died_this_year = draws < qx_term  # broadcasts qx_term across rows
+
+        # For each simulation, find the FIRST year (smallest index) where
+        # death occurred. If no death occurred, argmax returns 0 on an
+        # all-False row, so we must separately check "did they ever die".
+        ever_died = died_this_year.any(axis=1)
+        year_of_death_index = died_this_year.argmax(axis=1)  # 0-based index
+        year_of_death = year_of_death_index + 1  # convert to 1-based year k
+
+        discount_factors = 1 / ((1 + self.discount_rate) ** year_of_death)
+        pv_payouts = np.where(ever_died, self.face_amount * discount_factors, 0.0)
 
         return pv_payouts
 
+    # ---------- summary ----------
 
     def summary(self):
         return {
